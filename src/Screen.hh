@@ -69,8 +69,10 @@ class Menu;
 class ImageControl;
 class LayerItem;
 class FbWindow;
+class TextButton;
 }
 
+typedef std::map<std::string, FbTk::TextButton*> ToolButtonMap;
 
 /// Handles screen connection, screen clients and workspaces
 /**
@@ -126,6 +128,11 @@ public:
     Slit *slit() { return m_slit.get(); }
     /// @return the slit, @see Slit
     const Slit *slit() const { return m_slit.get(); }
+
+    /// @return the toolbar, @see Toolbar
+    Toolbar *toolbar() { return m_toolbar.get(); }
+    /// @return the toolbar, @see Toolbar
+    const Toolbar *toolbar() const { return m_toolbar.get(); }
     /**
      * @param w the workspace number
      * @return workspace for the given workspace number
@@ -248,6 +255,7 @@ public:
     FbTk::ThemeProxy<FbTk::MenuTheme> &menuTheme() { return *m_menutheme.get(); }
     const FbTk::ThemeProxy<FbTk::MenuTheme> &menuTheme() const { return *m_menutheme.get(); }
     const FbTk::ThemeProxy<RootTheme> &rootTheme() const { return *m_root_theme.get(); }
+    FbTk::ThemeProxy<RootTheme> &rootTheme() { return *m_root_theme.get(); }
 
     FbTk::ThemeProxy<WinButtonTheme> &focusedWinButtonTheme() { return *m_focused_winbutton_theme.get(); }
     const FbTk::ThemeProxy<WinButtonTheme> &focusedWinButtonTheme() const { return *m_focused_winbutton_theme.get(); }
@@ -337,9 +345,18 @@ public:
     void reassociateWindow(FluxboxWindow *window, unsigned int workspace_id,
                            bool ignore_sticky);
 
+#if USE_TOOLBAR
+    /**
+     * manage a map of named FbTk::TextButton's
+     */
+    void clearToolButtonMap();
+    void mapToolButton(std::string name, FbTk::TextButton *button);
+    bool relabelToolButton(std::string button, std::string label);
+#endif
 
     void reconfigure();
     void reconfigureTabs();
+    void reconfigureStruts();
     void rereadMenu();
     void rereadWindowMenu();
     void shutdown();
@@ -475,30 +492,32 @@ private:
 
     bool root_colormap_installed;
 
-    std::auto_ptr<FbTk::ImageControl> m_image_control;
-    std::auto_ptr<FbMenu> m_configmenu, m_rootmenu, m_workspacemenu, m_windowmenu;
+    std::unique_ptr<FbTk::ImageControl> m_image_control;
+    std::unique_ptr<FbMenu> m_configmenu, m_rootmenu, m_workspacemenu, m_windowmenu;
 
     Icons m_icon_list;
 
-    std::auto_ptr<Slit>     m_slit;
-    std::auto_ptr<Toolbar>  m_toolbar;
+    std::unique_ptr<Slit>     m_slit;
+    std::unique_ptr<Toolbar>  m_toolbar;
+    std::unique_ptr<ToolButtonMap> m_toolButtonMap;
 
     Workspace *m_current_workspace;
+    Workspace *m_former_workspace;
 
     WorkspaceNames m_workspace_names;
     Workspaces m_workspaces_list;
 
-    std::auto_ptr<FbWinFrameTheme> m_focused_windowtheme,
+    std::unique_ptr<FbWinFrameTheme> m_focused_windowtheme,
                                    m_unfocused_windowtheme;
-    std::auto_ptr<WinButtonTheme> m_focused_winbutton_theme,
+    std::unique_ptr<WinButtonTheme> m_focused_winbutton_theme,
             m_unfocused_winbutton_theme, m_pressed_winbutton_theme;
-    std::auto_ptr<FbTk::MenuTheme> m_menutheme;
-    std::auto_ptr<RootTheme> m_root_theme;
+    std::unique_ptr<FbTk::MenuTheme> m_menutheme;
+    std::unique_ptr<RootTheme> m_root_theme;
 
     FbRootWindow m_root_window;
-    std::auto_ptr<OSDWindow> m_geom_window;
-    std::auto_ptr<OSDWindow> m_pos_window;
-    std::auto_ptr<TooltipWindow> m_tooltip_window;
+    std::unique_ptr<OSDWindow> m_geom_window;
+    std::unique_ptr<OSDWindow> m_pos_window;
+    std::unique_ptr<TooltipWindow> m_tooltip_window;
     FbTk::FbWindow m_dummy_window;
 
     ScreenResource resource;
@@ -535,6 +554,7 @@ private:
     } m_xinerama;
 
     std::vector<HeadArea*> m_head_areas;
+    std::vector<Strut*> m_head_struts;
 
     struct {
         bool cycling;

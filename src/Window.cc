@@ -24,6 +24,7 @@
 
 #include "Window.hh"
 
+#include "CurrentWindowCmd.hh"
 #include "WinClient.hh"
 #include "fluxbox.hh"
 #include "Keys.hh"
@@ -272,6 +273,7 @@ WinButton* makeButton(FluxboxWindow& win, FocusableTheme<WinButtonTheme>& btheme
 
 
 int FluxboxWindow::s_num_grabs = 0;
+static int s_original_workspace = 0;
 
 FluxboxWindow::FluxboxWindow(WinClient &client):
     Focusable(client.screen(), this),
@@ -290,7 +292,7 @@ FluxboxWindow::FluxboxWindow(WinClient &client):
     m_old_decoration_mask(0),
     m_client(&client),
     m_toggled_decos(false),
-    m_focus_new(BoolAcc(screen().focusControl(), &FocusControl::focusNew)),
+    m_focus_protection(Focus::NoProtection),
     m_mouse_focus(BoolAcc(screen().focusControl(), &FocusControl::isMouseFocus)),
     m_click_focus(true),
     m_last_button_x(0),  m_last_button_y(0),
@@ -360,6 +362,7 @@ FluxboxWindow::~FluxboxWindow() {
     m_labelbuttons.clear();
 
     m_timer.stop();
+    m_tabActivationTimer.stop();
 
     // notify die
     dieSig().emit(*this);
@@ -441,6 +444,11 @@ void FluxboxWindow::init() {
     m_timer.setCommand(raise_cmd);
     m_timer.fireOnce(true);
 
+    m_tabActivationTimer.setTimeout(fluxbox.getAutoRaiseDelay() * FbTk::FbTime::IN_MILLISECONDS);
+    FbTk::RefCount<ActivateTabCmd> activate_tab_cmd(new ActivateTabCmd());
+    m_tabActivationTimer.setCommand(activate_tab_cmd);
+    m_tabActivationTimer.fireOnce(true);
+
     /**************************************************/
     /* Read state above here, apply state below here. */
     /**************************************************/
@@ -457,14 +465,46 @@ void FluxboxWindow::init() {
 
     setWindowType(m_client->getWindowType());
 
-    bool is_visible = isWindowVisibleOnSomeHeadOrScreen(*this);
+    auto sanitizePosition = [&]() {
+        int head = screen().getHead(fbWindow());
+        if (head == 0 && screen().hasXinerama())
+            head = screen().getCurrHead();
+        int left = screen().maxLeft(head),   top  = screen().maxTop(head),
+            btm  = screen().maxBottom(head), rght = screen().maxRight(head);
+        const int margin = hasTitlebar() ? 32 : 8;
+        // ensure the window intersects with the workspace x-axis
+        if (int(frame().x() + frame().width()) < left) {
+            left += margin - frame().width();
+        } else if (frame().x() > rght) {
+            left = rght - margin;
+        } else {
+            left = frame().x();
+        }
+        if (hasTitlebar()) {
+            // ensure the titlebar is inside the workspace
+            top  = std::max(top,  std::min(frame().y(), btm  - margin));
+        } else {
+            // ensure "something" is inside the workspace
+            if (int(frame().y() + frame().height()) < top)
+                top += margin - frame().height();
+            else if (frame().y() > btm)
+                top = btm - margin;
+            else
+                top = frame().y();
+        }
+        frame().move(left, top);
+    };
 
-    if (fluxbox.isStartup())
+    if (fluxbox.isStartup()) {
         m_placed = true;
-    else if (m_client->normal_hint_flags & (PPosition|USPosition)) {
-        m_placed = is_visible;
+    } else if (m_client->normal_hint_flags & (PPosition|USPosition)) {
+        m_placed = true;
+        sanitizePosition();
     } else {
-        if (!is_visible) {
+        if (!isWindowVisibleOnSomeHeadOrScreen(*this)) {
+            // this probably should never happen, but if a window
+            // unexplicitly has its topleft corner outside any screen,
+            // move it to the current screen and ensure it's just placed
             int cur = screen().getHead(fbWindow());
             move(screen().getHeadX(cur), screen().getHeadY(cur));
             m_placed = false; // allow placement strategy to fix position
@@ -476,6 +516,25 @@ void FluxboxWindow::init() {
     applyDecorations();
 
     fluxbox.attachSignals(*this);
+
+    if (!m_state.fullscreen) {
+        unsigned int new_width = 0, new_height = 0;
+        if (m_client->width() >= screen().width()) {
+            m_state.maximized |= WindowState::MAX_HORZ;
+            new_width = 2 * screen().width() / 3;
+        }
+        if (m_client->height() >= screen().height()) {
+            m_state.maximized |= WindowState::MAX_VERT;
+            new_height = 2 * screen().height() / 3;
+        }
+        if (new_width || new_height) {
+            const int maximized = m_state.maximized;
+            m_state.maximized = WindowState::MAX_NONE;
+            resize(new_width ? new_width : width(), new_height ? new_height : height());
+            m_placed = false;
+            m_state.maximized = maximized;
+        }
+    }
 
     // this window is managed, we are now allowed to modify actual state
     m_initialized = true;
@@ -490,22 +549,15 @@ void FluxboxWindow::init() {
     // if we're a transient then we should be on the same layer and workspace
     FluxboxWindow* twin = m_client->transientFor() ? m_client->transientFor()->fbwindow() : 0;
     if (twin && twin != this) {
-        layerItem().setLayer(twin->layerItem().getLayer());
-        m_state.layernum = twin->layerNum();
+        if (twin->layerNum() < ResourceLayer::DESKTOP) { // don't confine layer for desktops
+            layerItem().setLayer(twin->layerItem().getLayer());
+            m_state.layernum = twin->layerNum();
+        }
         m_workspace_number = twin->workspaceNumber();
-        int x;
-        int y;
-        if (twin->frame().width() > frame().width()) {
-            x = twin->frame().x() + (twin->frame().width() - frame().width())/2;
-        } else {
-            x = twin->frame().x() - (frame().width() - twin->frame().width())/2;
-        }
-        if (twin->frame().height() > frame().height()) {
-            y = twin->frame().y() + (twin->frame().height() - frame().height())/2;
-        } else {
-            y = twin->frame().y() - (frame().height() - twin->frame().height())/2;
-        }
+        const int x = twin->frame().x() + int(twin->frame().width() - frame().width())/2;
+        const int y = twin->frame().y() + int(twin->frame().height() - frame().height())/2;
         frame().move(x, y);
+        sanitizePosition();
         m_placed = true;
     } else // if no parent then set default layer
         moveToLayer(m_state.layernum, m_state.layernum != ::ResourceLayer::NORMAL);
@@ -543,8 +595,11 @@ void FluxboxWindow::init() {
         deiconify(false);
         // check if we should prevent this window from gaining focus
         m_focused = false; // deiconify sets this
-        if (!Fluxbox::instance()->isStartup() && m_focus_new) {
+        if (!Fluxbox::instance()->isStartup() && isFocusNew()) {
+            Focus::Protection fp = m_focus_protection;
+            m_focus_protection &= ~Focus::Deny; // new windows run as "Refuse"
             m_focused = focusRequestFromClient(*m_client);
+            m_focus_protection = fp;
             if (!m_focused)
                 lower();
         }
@@ -635,9 +690,9 @@ void FluxboxWindow::attachClient(WinClient &client, int x, int y) {
         bool is_startup = Fluxbox::instance()->isStartup();
 
         // we use m_focused as a signal to focus the window when mapped
-        if (m_focus_new && !is_startup)
+        if (isFocusNew() && !is_startup)
             m_focused = focusRequestFromClient(client);
-        focused_win = (m_focus_new || is_startup) ? &client : m_client;
+        focused_win = (isFocusNew() || is_startup) ? &client : m_client;
 
         m_clientlist.push_back(&client);
     }
@@ -969,11 +1024,14 @@ bool FluxboxWindow::setCurrentClient(WinClient &client, bool setinput) {
     if (!button)
         return false;
 
+    if (!client.acceptsFocus())
+        setinput = false; // don't try
+
     WinClient *old = m_client;
     m_client = &client;
 
     bool ret = setinput && focus();
-    if (setinput) {
+    if (setinput && old->acceptsFocus()) {
         m_client = old;
         return ret;
     }
@@ -1000,6 +1058,14 @@ bool FluxboxWindow::isGroupable() const {
     if (isResizable() && isMaximizable() && !winClient().isTransient())
         return true;
     return false;
+}
+
+bool FluxboxWindow::isFocusNew() const {
+    if (m_focus_protection & Focus::Gain)
+        return true;
+    if (m_focus_protection & Focus::Refuse)
+        return false;
+    return screen().focusControl().focusNew();
 }
 
 void FluxboxWindow::associateClientWindow() {
@@ -1071,6 +1137,7 @@ void FluxboxWindow::reconfigure() {
     setFocusFlag(m_focused);
     moveResize(frame().x(), frame().y(), frame().width(), frame().height());
     m_timer.setTimeout(Fluxbox::instance()->getAutoRaiseDelay() * FbTk::FbTime::IN_MILLISECONDS);
+    m_tabActivationTimer.setTimeout(Fluxbox::instance()->getAutoRaiseDelay() * FbTk::FbTime::IN_MILLISECONDS);
     updateButtons();
     frame().reconfigure();
     menu().reconfigure();
@@ -1085,9 +1152,7 @@ void FluxboxWindow::reconfigure() {
 void FluxboxWindow::updateMWMHintsFromClient(WinClient &client) {
     const WinClient::MwmHints *hint = client.getMwmHint();
 
-    if (!hint) return;
-
-    if (!m_toggled_decos && hint->flags & MwmHintsDecorations) {
+    if (hint && !m_toggled_decos && hint->flags & MwmHintsDecorations) {
         if (hint->decorations & MwmDecorAll) {
             decorations.titlebar = decorations.handle = decorations.border =
                 decorations.iconify = decorations.maximize =
@@ -1112,6 +1177,9 @@ void FluxboxWindow::updateMWMHintsFromClient(WinClient &client) {
             if (hint->decorations & MwmDecorMaximize)
                 decorations.maximize = true;
         }
+    } else {
+        decorations.titlebar = decorations.handle = decorations.border =
+        decorations.iconify = decorations.maximize = decorations.menu = true;
     }
 
     unsigned int mask = decorationMask();
@@ -1120,7 +1188,7 @@ void FluxboxWindow::updateMWMHintsFromClient(WinClient &client) {
 
     // functions.tabable is ours, not special one
     // note that it means this window is "tabbable"
-    if (hint->flags & MwmHintsFunctions) {
+    if (hint && hint->flags & MwmHintsFunctions) {
         if (hint->functions & MwmFuncAll) {
             functions.resize = functions.move = functions.iconify =
                 functions.maximize = functions.close = true;
@@ -1139,6 +1207,9 @@ void FluxboxWindow::updateMWMHintsFromClient(WinClient &client) {
             if (hint->functions & MwmFuncClose)
                 functions.close = true;
         }
+    } else {
+        functions.resize = functions.move = functions.iconify =
+        functions.maximize = functions.close = true;
     }
 }
 
@@ -1396,8 +1467,10 @@ void FluxboxWindow::deiconify(bool do_raise) {
         }
     }
 
-    if (m_workspace_number != screen().currentWorkspaceID())
+    if (m_workspace_number != screen().currentWorkspaceID()) {
+        oplock = false;
         return;
+    }
 
     show();
 
@@ -1405,7 +1478,7 @@ void FluxboxWindow::deiconify(bool do_raise) {
     // but not on startup: focus will be handled after creating everything
     // we use m_focused as a signal to focus the window when mapped
     if (screen().currentWorkspace()->numberOfWindows() == 1 ||
-        m_focus_new || m_client->isTransient())
+        isFocusNew() || m_client->isTransient())
         m_focused = true;
 
     oplock = false;
@@ -1461,7 +1534,8 @@ void FluxboxWindow::setFullscreenLayer() {
          foc->winClient().transientFor()->fbwindow() == this)) {
         moveToLayer(::ResourceLayer::ABOVE_DOCK);
     } else {
-        moveToLayer(::ResourceLayer::DESKTOP);
+        moveToLayer(foc->layerNum());
+        foc->raise();
     }
     stateSig().emit(*this);
 
@@ -2000,9 +2074,12 @@ void FluxboxWindow::mapRequestEvent(XMapRequestEvent &re) {
     setCurrentClient(*client, false); // focus handled on MapNotify
     deiconify();
 
-    if (m_focus_new) {
+    if (isFocusNew()) {
         m_focused = false; // deiconify sets this
+        Focus::Protection fp = m_focus_protection;
+        m_focus_protection &= ~Focus::Deny; // goes by "Refuse"
         m_focused = focusRequestFromClient(*client);
+        m_focus_protection = fp;
         if (!m_focused)
             lower();
     }
@@ -2018,9 +2095,13 @@ bool FluxboxWindow::focusRequestFromClient(WinClient &from) {
 
     FluxboxWindow *cur = FocusControl::focusedFbWindow();
     WinClient *client = FocusControl::focusedWindow();
-    if (cur && getRootTransientFor(&from) != getRootTransientFor(client))
+    if ((from.fbwindow() && (from.fbwindow()->focusProtection() & Focus::Deny)) ||
+        (cur && (cur->focusProtection() & Focus::Lock))) {
+        ret = false;
+    } else if (cur && getRootTransientFor(&from) != getRootTransientFor(client)) {
         ret = !(cur->isFullscreen() && getOnHead() == cur->getOnHead()) &&
               !cur->isTyping();
+    }
 
     if (!ret)
         Fluxbox::instance()->attentionHandler().addAttention(from);
@@ -2064,6 +2145,8 @@ void FluxboxWindow::unmapNotifyEvent(XUnmapEvent &ue) {
     fbdbg<<"("<<__FUNCTION__<<"): 0x"<<hex<<client->window()<<dec<<endl;
     fbdbg<<"("<<__FUNCTION__<<"): title="<<client->title().logical()<<endl;
 
+    if (numClients() == 1) // unmapping the last client
+        frame().hide(); // hide this now, otherwise compositors will fade out the frame, bug #1110
     restore(client, false);
 
 }
@@ -2333,32 +2416,58 @@ void FluxboxWindow::buttonPressEvent(XButtonEvent &be) {
     m_last_button_y = be.y_root;
     m_last_pressed_button = be.button;
 
+    FbTk::Menu::hideShownMenu();
+
     Keys *k = Fluxbox::instance()->keys();
-    int context = frame().getContext(be.window);
-    if (k->doAction(be.type, be.state, be.button,
-                    context, &winClient(), be.time)) {
+    int context = 0;
+    context = frame().getContext(be.subwindow ? be.subwindow : be.window, be.x_root, be.y_root);
+    if (!context && be.subwindow)
+        context = frame().getContext(be.window);
+
+    if (k->doAction(be.type, be.state, be.button, context, &winClient(), be.time)) {
+        XAllowEvents(display, SyncPointer, CurrentTime);
         return;
     }
+
+    WinClient *client = 0;
+    if (!screen().focusControl().isMouseTabFocus()) {
+        // determine if we're in a label button (tab)
+        client = winClientOfLabelButtonWindow(be.window);
+    }
+
+
+    // - refeed the event into the queue so the app or titlebar subwindow gets it
+    if (be.subwindow)
+        XAllowEvents(display, ReplayPointer, CurrentTime);
+    else
+        XAllowEvents(display, SyncPointer, CurrentTime);
 
     // if nothing was bound via keys-file then
     // - raise() if clickRaise is enabled
     // - hide open menues
     // - focus on clickFocus
-    // - refeed the event into the queue so the app gets it
     if (frame().window().window() == be.window) {
         if (screen().clickRaises())
             raise();
 
-        XAllowEvents(display, ReplayPointer, be.time);
-
         m_button_grab_x = be.x_root - frame().x() - frame().window().borderWidth();
         m_button_grab_y = be.y_root - frame().y() - frame().window().borderWidth();
     }
-    FbTk::Menu::hideShownMenu();
+
     if (!m_focused && acceptsFocus() && m_click_focus)
         focus();
 
+    if (!screen().focusControl().isMouseTabFocus() &&
+        client && client != m_client &&
+        !screen().focusControl().isIgnored(be.x_root, be.y_root) ) {
+        setCurrentClient(*client, isFocused());
+    }
+
+
+
 }
+
+const unsigned int DEADZONE = 4;
 
 void FluxboxWindow::buttonReleaseEvent(XButtonEvent &re) {
 
@@ -2372,11 +2481,15 @@ void FluxboxWindow::buttonReleaseEvent(XButtonEvent &re) {
         stopResizing();
     else if (m_attaching_tab)
         attachTo(re.x_root, re.y_root);
-    else if (!frame().tabcontainer().tryButtonReleaseEvent(re)) {
+    else if (std::abs(m_last_button_x - re.x_root) + std::abs(m_last_button_y - re.y_root) < DEADZONE) {
+        int context = 0;
+        context = frame().getContext(re.subwindow ? re.subwindow : re.window,
+                                     re.x_root, re.y_root);
+        if (!context && re.subwindow)
+            context = frame().getContext(re.window);
 
-        if (m_last_button_x == re.x_root && m_last_button_y == re.y_root) {
-            Fluxbox::instance()->keys()->doAction(re.type, re.state, re.button, Keys::ON_WINDOW, &winClient(), re.time);
-        }
+        Fluxbox::instance()->keys()->doAction(re.type, re.state, re.button,
+                                              context, &winClient(), re.time);
     }
 }
 
@@ -2399,9 +2512,16 @@ void FluxboxWindow::motionNotifyEvent(XMotionEvent &me) {
 
     // in case someone put  MoveX :StartMoving etc into keys, we have
     // to activate it before doing the actual motionNotify code
-    Fluxbox::instance()->keys()->doAction(me.type, me.state, m_last_pressed_button, context, &winClient(), me.time);
+    if (std::abs(m_last_button_x - me.x_root) + std::abs(m_last_button_y - me.y_root) >= DEADZONE) {
+        XEvent &e = const_cast<XEvent&>(Fluxbox::instance()->lastEvent()); // is copy of "me"
+        e.xmotion.x_root = m_last_button_x;
+        e.xmotion.y_root = m_last_button_y;
+        Fluxbox::instance()->keys()->doAction(me.type, me.state, m_last_pressed_button, context, &winClient(), me.time);
+        e.xmotion.x = me.x_root;
+        e.xmotion.y = me.y_root;
+    }
 
-    if (moving) {
+    if (moving || m_attaching_tab) {
 
         XEvent e;
 
@@ -2410,6 +2530,8 @@ void FluxboxWindow::motionNotifyEvent(XMotionEvent &me) {
             return;
         }
 
+        const bool xor_outline = m_attaching_tab || !screen().doOpaqueMove();
+
         // Warp to next or previous workspace?, must have moved sideways some
         int moved_x = me.x_root - m_last_resize_x;
         // save last event point
@@ -2417,7 +2539,7 @@ void FluxboxWindow::motionNotifyEvent(XMotionEvent &me) {
         m_last_resize_y = me.y_root;
 
         // undraw rectangle before warping workspaces
-        if (!screen().doOpaqueMove()) {
+        if (xor_outline) {
             int bw = static_cast<int>(frame().window().borderWidth());
             int w = static_cast<int>(frame().width()) + 2*bw -1;
             int h = static_cast<int>(frame().height()) + 2*bw - 1;
@@ -2456,7 +2578,8 @@ void FluxboxWindow::motionNotifyEvent(XMotionEvent &me) {
                 XWarpPointer(display, None, me.root, 0, 0, 0, 0,
                         m_last_resize_x, m_last_resize_y);
 
-                if (screen().doOpaqueMove())
+                if (m_attaching_tab || // tabbing grabs the pointer, we must not hide the window!
+                            screen().doOpaqueMove())
                     screen().sendToWorkspace(new_id, this, true);
                 else
                     screen().changeWorkspaceID(new_id, false);
@@ -2470,11 +2593,12 @@ void FluxboxWindow::motionNotifyEvent(XMotionEvent &me) {
         dy -= frame().window().borderWidth();
 
         // dx = current left side, dy = current top
-        doSnapping(dx, dy);
+        if (moving)
+            doSnapping(dx, dy);
 
         // do not update display if another motion event is already pending
 
-        if (!screen().doOpaqueMove()) {
+        if (xor_outline) {
             int bw = frame().window().borderWidth();
             int w = static_cast<int>(frame().width()) + 2*bw - 1;
             int h = static_cast<int>(frame().height()) + 2*bw - 1;
@@ -2488,8 +2612,8 @@ void FluxboxWindow::motionNotifyEvent(XMotionEvent &me) {
             // need to move the base window without interfering with transparency
             frame().quietMoveResize(dx, dy, frame().width(), frame().height());
         }
-
-        screen().showPosition(dx, dy);
+        if (moving)
+            screen().showPosition(dx, dy);
         // end if moving
     } else if (resizing) {
 
@@ -2628,45 +2752,37 @@ void FluxboxWindow::motionNotifyEvent(XMotionEvent &me) {
                     m_last_resize_h - 1 + 2 * frame().window().borderWidth());
 
         }
-    } else if (m_attaching_tab != 0) {
-        //
-        // drag'n'drop code for tabs
-        //
-
-        // we already grabed and started to drag'n'drop tab
-        // so we update drag'n'drop-rectangle
-        int dx = me.x_root - m_button_grab_x, dy = me.y_root - m_button_grab_y;
-
-        parent().drawRectangle(screen().rootTheme()->opGC(),
-                               m_last_move_x, m_last_move_y,
-                               m_last_resize_w, m_last_resize_h);
-        parent().drawRectangle(screen().rootTheme()->opGC(),
-                               dx, dy,
-                               m_last_resize_w, m_last_resize_h);
-
-        // change remembered position of rectangle
-        m_last_move_x = dx;
-        m_last_move_y = dy;
     }
-
 }
 
 void FluxboxWindow::enterNotifyEvent(XCrossingEvent &ev) {
 
-    // ignore grab activates, or if we're not visible
-    if (ev.mode == NotifyGrab || ev.mode == NotifyUngrab ||
-        !isVisible()) {
+    static FluxboxWindow *s_last_really_entered = 0;
+
+    if (ev.mode == NotifyUngrab && s_last_really_entered == this) {
+        // if this results from an ungrab, only act if the window really changed.
+        // otherwise we might pollute the focus which could have been assigned
+        // by alt+tab (bug #597)
         return;
     }
 
+    // ignore grab activates, or if we're not visible
+    if (ev.mode == NotifyGrab || !isVisible()) {
+        return;
+    }
+
+    s_last_really_entered = this;
     if (ev.window == frame().window())
         Fluxbox::instance()->keys()->doAction(ev.type, ev.state, 0,
                                               Keys::ON_WINDOW, m_client);
 
-    WinClient *client = 0;
-    if (screen().focusControl().isMouseTabFocus()) {
-        // determine if we're in a label button (tab)
-        client = winClientOfLabelButtonWindow(ev.window);
+    // determine if we're in a label button (tab)
+    WinClient *client = winClientOfLabelButtonWindow(ev.window);
+    if (client) {
+        if (IconButton *tab = m_labelbuttons[client]) {
+            m_has_tooltip = true;
+            tab->showTooltip();
+        }
     }
 
     if (ev.window == frame().window() ||
@@ -2694,7 +2810,7 @@ void FluxboxWindow::enterNotifyEvent(XCrossingEvent &ev) {
     if (screen().focusControl().isMouseTabFocus() &&
         client && client != m_client &&
         !screen().focusControl().isIgnored(ev.x_root, ev.y_root) ) {
-        setCurrentClient(*client, isFocused());
+        m_tabActivationTimer.start();
     }
 
 }
@@ -2705,6 +2821,11 @@ void FluxboxWindow::leaveNotifyEvent(XCrossingEvent &ev) {
     if (ev.mode == NotifyGrab || ev.mode == NotifyUngrab ||
         !isVisible()) {
         return;
+    }
+
+    if (m_has_tooltip) {
+        m_has_tooltip = false;
+        screen().hideTooltip();
     }
 
     // still inside?
@@ -2730,6 +2851,7 @@ void FluxboxWindow::setTitle(const std::string& title, Focusable &client) {
     frame().setFocusTitle(title);
     // relay title to others that display the focus title
     titleSig().emit(title, *this);
+    frame().tabcontainer().repositionItems();
 }
 
 void FluxboxWindow::frameExtentChanged() {
@@ -3208,6 +3330,7 @@ void FluxboxWindow::startTabbing(const XButtonEvent &be) {
     if (s_num_grabs > 0)
         return;
 
+    s_original_workspace = workspaceNumber();
     m_attaching_tab = winClientOfLabelButtonWindow(be.window);
 
     // start drag'n'drop for tab
@@ -3296,11 +3419,9 @@ void FluxboxWindow::attachTo(int x, int y, bool interrupted) {
             // disconnect client if we didn't drop on a window
             WinClient &client = *old_attached;
             detachClient(*old_attached);
-            // move window by relative amount of mouse movement
-            // since just detached, move relative to old location
-            if (client.fbwindow() != 0) {
-                client.fbwindow()->move(frame().x() - m_last_resize_x + x, frame().y() - m_last_resize_y + y);
-            }
+            screen().sendToWorkspace(s_original_workspace, this, false);
+            if (FluxboxWindow *fbwin = client.fbwindow())
+                fbwin->move(m_last_move_x, m_last_move_y);
         } else if( attach_to_win == this && attach_to_win->isTabable()) {
             //reording of tabs within a frame
             moveClientTo(*old_attached, x, y);
@@ -3824,8 +3945,21 @@ void FluxboxWindow::setOnHead(int head) {
     if (head > 0 && head <= screen().numHeads()) {
         int cur = screen().getHead(fbWindow());
         bool placed = m_placed;
-        move(screen().getHeadX(head) + frame().x() - screen().getHeadX(cur),
-             screen().getHeadY(head) + frame().y() - screen().getHeadY(cur));
+        int x = frame().x(), y = frame().y();
+        const int w = frame().width(), h = frame().height(), bw = frame().window().borderWidth();
+        const int sx = screen().getHeadX(cur), sw = screen().getHeadWidth(cur),
+                  sy = screen().getHeadY(cur), sh = screen().getHeadHeight(cur);
+        int d = sx + sw - (x + bw + w);
+        if (std::abs(sx - x) > bw && std::abs(d) <= bw) // right aligned
+            x = screen().getHeadX(head) + screen().getHeadWidth(head) - (w + bw + d);
+        else // calc top-left relative position
+            x = screen().getHeadWidth(head) * (x - sx) / sw + screen().getHeadX(head);
+        d = sy + sh - (y + bw + h);
+        if (std::abs(sy - y) > bw && std::abs(d) <= bw) // bottom aligned
+            y = screen().getHeadY(head) + screen().getHeadHeight(head) - (h + bw + d);
+        else // calc top-left relative position
+            y = screen().getHeadHeight(head) * (y - sy) / sh + screen().getHeadY(head);
+        move(x, y);
         m_placed = placed;
     }
 

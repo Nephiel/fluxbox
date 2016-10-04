@@ -25,6 +25,7 @@
 #include "IconbarTheme.hh"
 
 #include "Screen.hh"
+#include "Window.hh"
 
 #include "FbTk/App.hh"
 #include "FbTk/Command.hh"
@@ -51,8 +52,16 @@ IconButton::IconButton(const FbTk::FbWindow &parent,
     m_theme(win, focused_theme, unfocused_theme),
     m_pm(win.screen().imageControl()) {
 
+    m_title_update_timer.setTimeout(100 * FbTk::FbTime::IN_MILLISECONDS);
+    m_title_update_timer.fireOnce(true);
+    FbTk::RefCount<FbTk::Command<void> > ets(new FbTk::SimpleCommand<IconButton>(*this, &IconButton::clientTitleChanged));
+    m_title_update_timer.setCommand(ets);
     m_signals.join(m_win.titleSig(),
-                   MemFunIgnoreArgs(*this, &IconButton::clientTitleChanged));
+                   MemFunIgnoreArgs(m_title_update_timer, &FbTk::Timer::start));
+
+    if (m_win.fbwindow())
+        m_signals.join(m_win.fbwindow()->stateSig(),
+                       MemFunIgnoreArgs(*this, &IconButton::clientTitleChanged));
 
     m_signals.join(m_win.focusSig(),
                    MemFunIgnoreArgs(*this, &IconButton::reconfigAndClear));
@@ -238,6 +247,7 @@ void IconButton::refreshEverything(bool setup) {
 
 void IconButton::clientTitleChanged() {
     refreshEverything(true);
+    m_title_changed.emit();
 
     if (m_has_tooltip)
         showTooltip();
@@ -245,7 +255,10 @@ void IconButton::clientTitleChanged() {
 
 void IconButton::setupWindow() {
     m_icon_window.clear();
-    setText(m_win.title());
+    FbTk::FbString title = m_win.title().logical();
+    if (m_win.fbwindow() && m_win.fbwindow()->isIconic())
+        title = IconbarTool::iconifiedPrefix() + title + IconbarTool::iconifiedSuffix();
+    setText(title);
     FbTk::TextButton::clear();
 }
 
@@ -272,5 +285,12 @@ bool IconButton::setOrientation(FbTk::Orientation orient) {
         return true;
     }
     return false;
+}
+
+unsigned int IconButton::preferredWidth() const {
+    unsigned int r = TextButton::preferredWidth();
+    if (m_icon_pixmap.drawable())
+        r += m_icon_window.width() + 1;
+    return r;
 }
 

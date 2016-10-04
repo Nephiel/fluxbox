@@ -97,7 +97,7 @@ public:
     void forgetFocusHiddenstate() { focushiddenstate_remember= false; }
     void forgetIconHiddenstate() { iconhiddenstate_remember= false; }
     void forgetStuckstate() { stuckstate_remember = false; }
-    void forgetFocusNewWindow() { focusnewwindow_remember = false; }
+    void forgetFocusProtection() { focusprotection_remember = false; }
     void forgetJumpworkspace() { jumpworkspace_remember = false; }
     void forgetLayer() { layer_remember = false; }
     void forgetSaveOnClose() { save_on_close_remember = false; }
@@ -138,8 +138,8 @@ public:
         { decostate = state; decostate_remember = true; }
     void rememberStuckstate(bool state)
         { stuckstate = state; stuckstate_remember = true; }
-    void rememberFocusNewWindow(bool state)
-        { focusnewwindow = state; focusnewwindow_remember = true; }
+    void rememberFocusProtection(unsigned int protect)
+        { focusprotection = protect; focusprotection_remember = true; }
     void rememberJumpworkspace(bool state)
         { jumpworkspace = state; jumpworkspace_remember = true; }
     void rememberLayer(int layernum)
@@ -166,6 +166,8 @@ public:
     bool dimension_is_w_relative;
     bool dimension_is_h_relative;
 
+    bool ignoreSizeHints_remember;
+
     bool position_remember;
     int x,y;
     bool position_is_x_relative;
@@ -188,8 +190,8 @@ public:
     bool stuckstate_remember;
     bool stuckstate;
 
-    bool focusnewwindow_remember;
-    bool focusnewwindow;
+    bool focusprotection_remember;
+    unsigned int focusprotection;
 
     bool focushiddenstate_remember;
     bool focushiddenstate;
@@ -241,7 +243,7 @@ void Application::reset() {
         position_remember =
         shadedstate_remember =
         stuckstate_remember =
-        focusnewwindow_remember =
+        focusprotection_remember =
         tabstate_remember =
         workspace_remember =
         head_remember =
@@ -429,6 +431,8 @@ bool handleStartupItem(const string &line, int offset) {
 int parseApp(ifstream &file, Application &app, string *first_line = 0) {
     string line;
     _FB_USES_NLS;
+    Focus::Protection protect = Focus::NoProtection;
+    bool remember_protect = false;
     int row = 0;
     while (! file.eof()) {
         if (!(first_line || getline(file, line))) {
@@ -495,6 +499,8 @@ int parseApp(ifstream &file, Application &app, string *first_line = 0) {
                 app.rememberDimensions(w, h, w_relative, h_relative);
             } else
                 had_error = true;
+        } else if (str_key == "ignoresizehints") {
+            app.ignoreSizeHints_remember = str_label == "yes";
         } else if (str_key == "position") {
             FluxboxWindow::ReferenceCorner r = FluxboxWindow::LEFTTOP;
             // more info about the parameter
@@ -548,7 +554,32 @@ int parseApp(ifstream &file, Application &app, string *first_line = 0) {
         } else if (str_key == "sticky") {
             app.rememberStuckstate(str_label == "yes");
         } else if (str_key == "focusnewwindow") {
-            app.rememberFocusNewWindow(str_label == "yes");
+            remember_protect = true;
+            if (!(protect & (Focus::Gain|Focus::Refuse))) { // cut back on contradiction
+                if (str_label == "yes")
+                    protect |= Focus::Gain;
+                else
+                    protect |= Focus::Refuse;
+            }
+        } else if (str_key == "focusprotection") {
+            remember_protect = true;
+            std::list<std::string> labels;
+            FbTk::StringUtil::stringtok(labels, str_label, ", ");
+            std::list<std::string>::iterator it = labels.begin();
+            for (; it != labels.end(); ++it) {
+                if (*it == "lock")
+                    protect = (protect & ~Focus::Deny) | Focus::Lock;
+                else if (*it == "deny")
+                    protect = (protect & ~Focus::Lock) | Focus::Deny;
+                else if (*it == "gain")
+                    protect = (protect & ~Focus::Refuse) | Focus::Gain;
+                else if (*it == "refuse")
+                    protect = (protect & ~Focus::Gain) | Focus::Refuse;
+                else if (*it == "none")
+                    protect = Focus::NoProtection;
+                else
+                    had_error = 1;
+            }
         } else if (str_key == "minimized") {
             app.rememberMinimizedstate(str_label == "yes");
         } else if (str_key == "maximized") {
@@ -567,7 +598,7 @@ int parseApp(ifstream &file, Application &app, string *first_line = 0) {
         } else if (str_key == "close") {
             app.rememberSaveOnClose(str_label == "yes");
         } else if (str_key == "end") {
-            return row;
+            break;
         } else {
             cerr << _FB_CONSOLETEXT(Remember, Unknown, "Unknown apps key", "apps entry type not known")<<" = " << str_key << endl;
         }
@@ -575,6 +606,8 @@ int parseApp(ifstream &file, Application &app, string *first_line = 0) {
             cerr<<"Error parsing apps entry: ("<<line<<")"<<endl;
         }
     }
+    if (remember_protect)
+        app.rememberFocusProtection(protect);
     return row;
 }
 
@@ -1006,8 +1039,30 @@ void Remember::save() {
         if (a.stuckstate_remember) {
             apps_file << "  [Sticky]\t{" << ((a.stuckstate)?"yes":"no") << "}" << endl;
         }
-        if (a.focusnewwindow_remember) {
-            apps_file << "  [FocusNewWindow]\t{" << ((a.focusnewwindow)?"yes":"no") << "}" << endl;
+        if (a.focusprotection_remember) {
+            apps_file << "  [FocusProtection]\t{";
+            if (a.focusprotection == Focus::NoProtection) {
+                apps_file << "none";
+            } else {
+                bool b = false;
+                if (a.focusprotection & Focus::Gain) {
+                    apps_file << (b?",":"") << "gain";
+                    b = true;
+                }
+                if (a.focusprotection & Focus::Refuse) {
+                    apps_file << (b?",":"") << "refuse";
+                    b = true;
+                }
+                if (a.focusprotection & Focus::Lock) {
+                    apps_file << (b?",":"") << "lock";
+                    b = true;
+                }
+                if (a.focusprotection & Focus::Deny) {
+                    apps_file << (b?",":"") << "deny";
+                    b = true;
+                }
+            }
+            apps_file << "}" << endl;
         }
         if (a.minimizedstate_remember) {
             apps_file << "  [Minimized]\t{" << ((a.minimizedstate)?"yes":"no") << "}" << endl;
@@ -1068,6 +1123,9 @@ bool Remember::isRemembered(WinClient &winclient, Attribute attrib) {
     case REM_DIMENSIONS:
         return app->dimensions_remember;
         break;
+    case REM_IGNORE_SIZEHINTS:
+        return app->ignoreSizeHints_remember;
+        break;
     case REM_POSITION:
         return app->position_remember;
         break;
@@ -1080,8 +1138,8 @@ bool Remember::isRemembered(WinClient &winclient, Attribute attrib) {
     case REM_STUCKSTATE:
         return app->stuckstate_remember;
         break;
-    case REM_FOCUSNEWWINDOW:
-        return app->focusnewwindow_remember;
+    case REM_FOCUSPROTECTION:
+        return app->focusprotection_remember;
         break;
     case REM_MINIMIZEDSTATE:
         return app->minimizedstate_remember;
@@ -1163,8 +1221,8 @@ void Remember::rememberAttrib(WinClient &winclient, Attribute attrib) {
     case REM_STUCKSTATE:
         app->rememberStuckstate(win->isStuck());
         break;
-    case REM_FOCUSNEWWINDOW:
-        app->rememberFocusNewWindow(win->isFocusNew());
+    case REM_FOCUSPROTECTION:
+        app->rememberFocusProtection(win->focusProtection());
         break;
     case REM_MINIMIZEDSTATE:
         app->rememberMinimizedstate(win->isIconic());
@@ -1214,6 +1272,9 @@ void Remember::forgetAttrib(WinClient &winclient, Attribute attrib) {
     case REM_DIMENSIONS:
         app->forgetDimensions();
         break;
+    case REM_IGNORE_SIZEHINTS:
+        app->ignoreSizeHints_remember = false;
+        break;
     case REM_POSITION:
         app->forgetPosition();
         break;
@@ -1226,8 +1287,8 @@ void Remember::forgetAttrib(WinClient &winclient, Attribute attrib) {
     case REM_STUCKSTATE:
         app->forgetStuckstate();
         break;
-    case REM_FOCUSNEWWINDOW:
-        app->forgetFocusNewWindow();
+    case REM_FOCUSPROTECTION:
+        app->forgetFocusProtection();
         break;
     case REM_MINIMIZEDSTATE:
         app->forgetMinimizedstate();
@@ -1352,8 +1413,9 @@ void Remember::setupFrame(FluxboxWindow &win) {
             (!win.isStuck() && app->stuckstate))
             win.stick(); // toggles
 
-    if (app->focusnewwindow_remember)
-        win.setFocusNew(app->focusnewwindow);
+    if (app->focusprotection_remember) {
+        win.setFocusProtection(app->focusprotection);
+    }
 
     if (app->minimizedstate_remember) {
         // if inconsistent...

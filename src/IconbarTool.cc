@@ -194,6 +194,7 @@ class ShowMenu: public FbTk::Command<void> {
 public:
     explicit ShowMenu(FluxboxWindow &win):m_win(win) { }
     void execute() {
+        FbTk::Menu::hideShownMenu();
         // get last button pos
         const XEvent &e = Fluxbox::instance()->lastEvent();
         m_win.popupMenu(e.xbutton.x_root, e.xbutton.y_root);
@@ -206,6 +207,7 @@ class FocusCommand: public FbTk::Command<void> {
 public:
     explicit FocusCommand(Focusable &win): m_win(win) { }
     void execute() {
+        FbTk::Menu::hideShownMenu();
         // this needs to be a local variable, as this object could be destroyed
         // if the workspace is changed.
         FluxboxWindow *fbwin = m_win.fbwindow();
@@ -224,6 +226,8 @@ private:
 };
 
 } // end anonymous namespace
+
+std::string IconbarTool::s_iconifiedDecoration[2];
 
 IconbarTool::IconbarTool(const FbTk::FbWindow &parent, IconbarTheme &theme,
                          FbTk::ThemeProxy<IconbarTheme> &focused_theme,
@@ -252,6 +256,8 @@ IconbarTool::IconbarTool(const FbTk::FbWindow &parent, IconbarTheme &theme,
            *screen.layerManager().getLayer(ResourceLayer::MENU)),
     m_alpha(255) {
 
+    updateIconifiedPattern();
+
     // setup mode menu
     setupModeMenu(m_menu, *this);
     _FB_USES_NLS;
@@ -279,6 +285,8 @@ IconbarTool::IconbarTool(const FbTk::FbWindow &parent, IconbarTheme &theme,
             FbTk::MemFun(*this, &IconbarTool::themeReconfigured));
     m_tracker.join(unfocused_theme.reconfigSig(),
             FbTk::MemFun(*this, &IconbarTool::themeReconfigured));
+    m_tracker.join(screen.reconfigureSig(),
+            FbTk::MemFunIgnoreArgs(*this, &IconbarTool::updateIconifiedPattern));
     themeReconfigured();
 }
 
@@ -292,7 +300,9 @@ void IconbarTool::move(int x, int y) {
 
 void IconbarTool::resize(unsigned int width, unsigned int height) {
     m_icon_container.resize(width, height);
-    m_icon_container.setMaxTotalSize(m_icon_container.orientation() == FbTk::ROT0 || m_icon_container.orientation() == FbTk::ROT180 ? width : height);
+    const unsigned int maxsize = (m_icon_container.orientation() & 1) ? height : width;
+    m_icon_container.setMaxTotalSize(maxsize);
+    m_icon_container.setMaxSizePerClient(maxsize/std::max(1, m_icon_container.size()));
     renderTheme();
 }
 
@@ -300,7 +310,9 @@ void IconbarTool::moveResize(int x, int y,
                              unsigned int width, unsigned int height) {
 
     m_icon_container.moveResize(x, y, width, height);
-    m_icon_container.setMaxTotalSize(m_icon_container.orientation() == FbTk::ROT0 || m_icon_container.orientation() == FbTk::ROT180 ? width : height);
+    const unsigned int maxsize = (m_icon_container.orientation() & 1) ? height : width;
+    m_icon_container.setMaxTotalSize(maxsize);
+    m_icon_container.setMaxSizePerClient(maxsize/std::max(1, m_icon_container.size()));
     renderTheme();
 }
 
@@ -348,6 +360,8 @@ void IconbarTool::setMode(string mode) {
     }
     reset();
 
+    resizeSig().emit();
+
     // unlock graphics update
     m_icon_container.setUpdateLock(false);
     m_icon_container.update();
@@ -360,6 +374,18 @@ void IconbarTool::setMode(string mode) {
 
 unsigned int IconbarTool::width() const {
     return m_icon_container.width();
+}
+
+unsigned int IconbarTool::preferredWidth() const {
+    // border and paddings
+    unsigned int w = 2*borderWidth() + *m_rc_client_padding * m_icons.size();
+
+    // the buttons
+    for (IconMap::const_iterator it = m_icons.begin(), end = m_icons.end(); it != end; ++it) {
+        w += it->second->preferredWidth();
+    }
+
+    return w;
 }
 
 unsigned int IconbarTool::height() const {
@@ -384,9 +410,6 @@ void IconbarTool::update(UpdateReason reason, Focusable *win) {
 
     m_icon_container.setAlignment(*m_rc_alignment);
 
-    *m_rc_client_width = FbTk::Util::clamp(*m_rc_client_width, 10, 400);
-    m_icon_container.setMaxSizePerClient(*m_rc_client_width);
-
     // lock graphic update
     m_icon_container.setUpdateLock(true);
 
@@ -404,6 +427,11 @@ void IconbarTool::update(UpdateReason reason, Focusable *win) {
             break;
     }
 
+    resizeSig().emit();
+    const unsigned int maxsize = (m_icon_container.orientation() & 1) ? height() : width();
+    m_icon_container.setMaxTotalSize(maxsize);
+    m_icon_container.setMaxSizePerClient(maxsize/std::max(1, m_icon_container.size()));
+
     // unlock container and update graphics
     m_icon_container.setUpdateLock(false);
     m_icon_container.update();
@@ -417,6 +445,19 @@ void IconbarTool::update(UpdateReason reason, Focusable *win) {
     // m_icon_container.update() above; then, it never runs drawText() again,
     // so text can end up behind program icons
     renderTheme();
+}
+
+void IconbarTool::updateIconifiedPattern() {
+    FbTk::Resource<std::string> p(m_screen.resourceManager(), "( %t )",
+                                  m_screen.name() + ".iconbar.iconifiedPattern",
+                                  m_screen.altName() + ".Iconbar.IconifiedPattern");
+    size_t tidx = p->find("%t");
+    s_iconifiedDecoration[0].clear();
+    s_iconifiedDecoration[1].clear();
+    if (tidx != std::string::npos) {
+        s_iconifiedDecoration[0] = p->substr(0, tidx);
+        s_iconifiedDecoration[1] = p->substr(tidx+2);
+    }
 }
 
 void IconbarTool::insertWindow(Focusable &win, int pos) {
@@ -441,6 +482,7 @@ void IconbarTool::insertWindow(Focusable &win, int pos) {
     }
 
     m_icon_container.insertItem(button, pos);
+    m_tracker.join(button->titleChanged(), FbTk::MemFun(resizeSig(), &FbTk::Signal<>::emit));
 }
 
 void IconbarTool::reset() {
