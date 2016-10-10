@@ -421,7 +421,7 @@ void ArrangeWindowsCmd::execute() {
     for (win = space->windowList().begin(); win != space->windowList().end(); ++win) {
         int winhead = screen->getHead((*win)->fbWindow());
         if ((winhead == head || winhead == 0) && m_pat.match(**win)) {
-
+            (*win)->setMaximizedState(WindowState::MAX_NONE);
             if ((m_tile_method >= STACKLEFT) && (*win)->isFocused()) {
                 main_window = (*win);
             } else {
